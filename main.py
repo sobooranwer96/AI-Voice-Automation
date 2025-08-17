@@ -4,9 +4,10 @@
 #   python -m uvicorn main:app --reload
 #
 # Requires:
-#   pip install fastapi uvicorn google-cloud-speech
+#   pip install fastapi uvicorn google-cloud-speech google-generativeai
 # And set Google credentials:
 #   export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service_account.json
+#   export VOICE_ASSISTANT_GEMINI_API_KEY=YOUR_GEMINI_API_KEY
 #
 # This app exposes:
 #   - GET  /    -> minimal HTML/JS client to stream mic audio over WebSocket and show live transcripts
@@ -36,11 +37,14 @@ from fastapi.responses import HTMLResponse
 # Google Cloud Speech-to-Text
 from google.cloud import speech
 
+# NEW: Import Google Generative AI (Gemini)
+import google.generativeai as genai
+
 # ------------------------------------------------------------------------------
 # Logging setup
 # ------------------------------------------------------------------------------
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG, # Set to DEBUG to see all granular logs
     format="%(asctime)s | %(levelname)s | %(threadName)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("voice-assistant")
@@ -48,7 +52,7 @@ logger = logging.getLogger("voice-assistant")
 # ------------------------------------------------------------------------------
 # FastAPI app
 # ------------------------------------------------------------------------------
-app = FastAPI(title="Real-time Voice Assistant (FastAPI + Google STT)")
+app = FastAPI(title="Real-time Voice Assistant (FastAPI + Google STT + Gemini)")
 
 # ------------------------------------------------------------------------------
 # HTML Client (embedded, self-contained)
@@ -209,6 +213,9 @@ HTML_CLIENT = """
           else setPartial(msg.text);
         } else if (msg.type === "info") {
           setStatus(msg.message);
+        } else if (msg.type === "gemini_response") {
+          addFinal("AI: " + msg.text);
+          setStatus("AI responded.");
         }
       } catch {
         // non-JSON messages, ignore
@@ -304,6 +311,17 @@ def stt_worker(
     loop: asyncio.AbstractEventLoop,
 ):
     thread_logger = logging.getLogger("stt-worker")
+    
+    # NEW: Initialize Gemini model
+    gemini_api_key = os.environ.get("VOICE_ASSISTANT_GEMINI_API_KEY")
+    if not gemini_api_key:
+        thread_logger.error("VOICE_ASSISTANT_GEMINI_API_KEY not set. Gemini calls will fail.")
+        gemini_model = None # Set to None if API key is missing
+    else:
+        genai.configure(api_key=gemini_api_key)
+        gemini_model = genai.GenerativeModel('gemini-2.5-flash')
+        thread_logger.info("Gemini model initialized.")
+
     try:
         if not credentials_ok:
             raise RuntimeError(
@@ -332,11 +350,11 @@ def stt_worker(
 
         # Iterate over responses (each response may contain multiple results)
         for response in responses:
-            thread_logger.debug("Raw response: %s", response)
+            thread_logger.debug("Raw STT response: %s", response) # Renamed log for clarity
 
             if not response.results:
                 loop.call_soon_threadsafe(
-                    resp_async_q.put_nowait, {"type": "info", "message": "No results in current response."}
+                    resp_async_q.put_nowait, {"type": "info", "message": "No STT results in current response."}
                 )
                 continue
 
@@ -346,19 +364,37 @@ def stt_worker(
                 transcript = result.alternatives[0].transcript
                 is_final = bool(result.is_final)
 
-                thread_logger.info("Transcript (%s): %s", "final" if is_final else "partial", transcript)
+                thread_logger.info("STT Transcript (%s): %s", "final" if is_final else "partial", transcript) # Renamed log for clarity
 
                 loop.call_soon_threadsafe(
                     resp_async_q.put_nowait,
                     {"type": "transcript", "text": transcript, "is_final": is_final},
                 )
 
+                # NEW: Call Gemini with final transcript
+                if is_final and gemini_model:
+                    thread_logger.info("Calling Gemini with final transcript: '%s'", transcript)
+                    try:
+                        gemini_response = gemini_model.generate_content(transcript)
+                        gemini_text = gemini_response.text
+                        thread_logger.info("Gemini Response: %s", gemini_text)
+                        loop.call_soon_threadsafe(
+                            resp_async_q.put_nowait,
+                            {"type": "gemini_response", "text": gemini_text},
+                        )
+                    except Exception as gemini_e:
+                        thread_logger.exception("Error calling Gemini API: %s", gemini_e)
+                        loop.call_soon_threadsafe(
+                            resp_async_q.put_nowait, {"type": "info", "message": f"Gemini error: {gemini_e}"}
+                        )
+
+
         thread_logger.info("Google streaming_recognize iterator ended.")
     except Exception as e:
         thread_logger.exception("STT worker error: %s", e)
         with contextlib.suppress(Exception):
             loop.call_soon_threadsafe(
-                resp_async_q.put_nowait, {"type": "info", "message": f"STT error: {e}"}
+                resp_async_q.put_nowait, {"type": "info", "message": f"STT worker critical error: {e}"}
             )
     finally:
         stop_event.set()
@@ -378,6 +414,14 @@ async def websocket_endpoint(ws: WebSocket):
         msg = "Server missing GOOGLE_APPLICATION_CREDENTIALS; transcription will not work."
         logger.error(msg)
         await ws.send_text(json.dumps({"type": "info", "message": msg}))
+    
+    # NEW: Check Gemini API key
+    gemini_key_ok = bool(os.environ.get("VOICE_ASSISTANT_GEMINI_API_KEY"))
+    if not gemini_key_ok:
+        msg = "Server missing VOICE_ASSISTANT_GEMINI_API_KEY; Gemini LLM will not work."
+        logger.error(msg)
+        await ws.send_text(json.dumps({"type": "info", "message": msg}))
+
 
     audio_q: Queue = Queue(maxsize=100)          # audio chunks for STT worker
     responses_q: asyncio.Queue = asyncio.Queue() # messages back to browser
@@ -394,7 +438,7 @@ async def websocket_endpoint(ws: WebSocket):
     stt_thread.start()
     logger.info("STT worker thread started.")
 
-    # Task to forward STT responses back to the client
+    # Task to forward STT responses and Gemini responses back to the client
     async def sender_task():
         try:
             while not stop_event.is_set():
@@ -431,7 +475,7 @@ async def websocket_endpoint(ws: WebSocket):
             if msg_type == "websocket.receive":
                 if "bytes" in data and data["bytes"] is not None:
                     chunk: bytes = data["bytes"]
-                    logger.info("Received audio chunk: %d bytes", len(chunk))
+                    logger.debug("Received audio chunk: %d bytes", len(chunk))
                     try:
                         audio_q.put_nowait(chunk)
                     except Exception:
@@ -479,4 +523,11 @@ async def on_startup():
         logger.info("GOOGLE_APPLICATION_CREDENTIALS is set: %s", cred)
     else:
         logger.warning("GOOGLE_APPLICATION_CREDENTIALS is not set. STT will fail until configured.")
+    
+    gemini_key = os.environ.get("VOICE_ASSISTANT_GEMINI_API_KEY")
+    if gemini_key:
+        logger.info("VOICE_ASSISTANT_GEMINI_API_KEY is set.")
+    else:
+        logger.warning("VOICE_ASSISTANT_GEMINI_API_KEY is not set. Gemini LLM will not work.")
+
     logger.info("App started. Open http://127.0.0.1:8000 in your browser.")
