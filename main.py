@@ -1,298 +1,482 @@
+# main.py
+#
+# Run with:
+#   python -m uvicorn main:app --reload
+#
+# Requires:
+#   pip install fastapi uvicorn google-cloud-speech
+# And set Google credentials:
+#   export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service_account.json
+#
+# This app exposes:
+#   - GET  /    -> minimal HTML/JS client to stream mic audio over WebSocket and show live transcripts
+#   - WS  /ws   -> receives 16 kHz, mono, 16-bit PCM (LINEAR16) audio bytes and streams to Google STT
+#
+# Notes:
+#   - We bridge FastAPI's asyncio world with Google Cloud's blocking streaming_recognize by
+#     pushing audio into a thread-safe queue and running the recognizer in a background thread.
+#   - It auto-detects which google-cloud-speech streaming API signature your environment uses:
+#       * Old style: client.streaming_recognize(config=StreamingRecognitionConfig, requests=audio_gen)
+#       * New style: client.streaming_recognize(requests=req_gen_with_first_config_request)
+#   - Logging is verbose to aid debugging of chunk sizes, API status, and raw responses.
+
 import asyncio
+import contextlib
+import inspect
+import json
+import logging
+import os
+import threading
+from queue import Queue, Empty
+from typing import Optional
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
-from google.cloud import speech_v1p1beta1 as speech
-import json
-import logging # ADDED: Import logging module
 
-# ADDED: Configure basic logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Google Cloud Speech-to-Text
+from google.cloud import speech
 
-app = FastAPI()
+# ------------------------------------------------------------------------------
+# Logging setup
+# ------------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(threadName)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("voice-assistant")
 
-# --- Configuration for Google Cloud Speech-to-Text ---
-RATE = 16000 # Sample rate in Hz
-CHANNELS = 1 # Mono audio
-ENCODING = speech.RecognitionConfig.AudioEncoding.LINEAR16 # Raw PCM
+# ------------------------------------------------------------------------------
+# FastAPI app
+# ------------------------------------------------------------------------------
+app = FastAPI(title="Real-time Voice Assistant (FastAPI + Google STT)")
 
-# HTML for the client-side interface
-html = """
+# ------------------------------------------------------------------------------
+# HTML Client (embedded, self-contained)
+# ------------------------------------------------------------------------------
+HTML_CLIENT = """
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Real-time Voice Assistant</title>
-    <style>
-        body { font-family: 'Inter', sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background-color: #f0f2f5; color: #333; }
-        .container { background-color: #fff; padding: 2.5rem; border-radius: 12px; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1); text-align: center; max-width: 500px; width: 90%; }
-        h1 { color: #2c3e50; margin-bottom: 1.5rem; }
-        button { background-color: #4CAF50; color: white; padding: 0.8rem 1.5rem; border: none; border-radius: 8px; cursor: pointer; font-size: 1rem; transition: background-color 0.3s ease, transform 0.2s ease; margin: 0.5rem; box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2); }
-        button:hover { background-color: #45a049; transform: translateY(-2px); }
-        button:active { transform: translateY(0); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2); }
-        button:disabled { background-color: #cccccc; cursor: not-allowed; box-shadow: none; }
-        #status { margin-top: 1.5rem; font-size: 1.1rem; color: #555; }
-        #transcription { margin-top: 1rem; padding: 1rem; background-color: #e9ecef; border-radius: 8px; min-height: 50px; text-align: left; word-wrap: break-word; overflow-wrap: break-word; }
-        .message { margin-bottom: 0.5rem; padding: 0.5rem; border-radius: 6px; }
-        .user-message { background-color: #d1e7dd; text-align: right; }
-        .ai-message { background-color: #f8d7da; text-align: left; }
-    </style>
+  <meta charset="utf-8"/>
+  <title>Real-time Voice Assistant Demo</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 2rem; }
+    h1 { margin-top: 0; }
+    button { padding: 0.6rem 1rem; margin-right: 0.5rem; border-radius: 8px; border: 1px solid #ccc; background: #f7f7f7; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #status { margin-top: 0.75rem; font-size: 0.95rem; color: #555; }
+    #transcript { margin-top: 1rem; padding: 1rem; min-height: 120px; border: 1px solid #ddd; border-radius: 8px; background: #fafafa; white-space: pre-wrap; }
+    .small { font-size: 0.85rem; color: #666; }
+    .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+    code { background: #f0f0f0; padding: 0 0.25rem; border-radius: 4px; }
+  </style>
 </head>
 <body>
-    <div class="container">
-        <h1>Real-time Voice Assistant</h1>
-        <button id="startButton">Start Listening</button>
-        <button id="stopButton" disabled>Stop Listening</button>
-        <p id="status">Click "Start Listening" to begin.</p>
-        <div id="transcription"></div>
-    </div>
+  <h1>🎙️ Real-time Transcription</h1>
+  <div class="row">
+    <button id="startBtn">Start Listening</button>
+    <button id="stopBtn" disabled>Stop Listening</button>
+    <span id="status">Idle</span>
+  </div>
+  <div id="transcript" aria-live="polite"></div>
+  <p class="small">
+    This demo captures microphone audio, downsamples to <code>16 kHz</code>, encodes as
+    <code>LINEAR16</code> (16-bit PCM), and streams it over a WebSocket to the server.
+    Live transcriptions appear above (partial and final).
+  </p>
 
-    <script>
-        let ws;
-        let mediaRecorder;
-        let audioChunks = [];
-        let isRecording = false;
+<script>
+(() => {
+  let ws = null;
+  let audioContext = null;
+  let mediaStream = null;
+  let sourceNode = null;
+  let processorNode = null;
+  let running = false;
 
-        const startButton = document.getElementById('startButton');
-        const stopButton = document.getElementById('stopButton');
-        const statusDisplay = document.getElementById('status');
-        const transcriptionDisplay = document.getElementById('transcription');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn  = document.getElementById('stopBtn');
+  const statusEl = document.getElementById('status');
+  const transcriptEl = document.getElementById('transcript');
 
-        // Function to update UI state
-        function updateUI(recording) {
-            isRecording = recording;
-            startButton.disabled = recording;
-            stopButton.disabled = !recording;
-            statusDisplay.textContent = recording ? "Listening..." : "Click 'Start Listening' to begin.";
-            if (!recording) {
-                transcriptionDisplay.textContent = ''; // Clear transcription when stopped
-            }
+  function setStatus(msg) {
+    statusEl.textContent = msg;
+  }
+
+  function setPartial(text) {
+    // Show/replace a single partial line at the end
+    const lines = transcriptEl.textContent.split("\\n");
+    if (lines.length && lines[lines.length - 1].startsWith("[partial] ")) {
+      lines[lines.length - 1] = "[partial] " + text;
+      transcriptEl.textContent = lines.join("\\n");
+    } else {
+      transcriptEl.textContent += (transcriptEl.textContent ? "\\n" : "") + "[partial] " + text;
+    }
+  }
+
+  function addFinal(text) {
+    // Replace any trailing partial with final; else just append
+    const lines = transcriptEl.textContent.split("\\n");
+    if (lines.length && lines[lines.length - 1].startsWith("[partial] ")) {
+      lines[lines.length - 1] = text;
+      transcriptEl.textContent = lines.join("\\n");
+    } else {
+      transcriptEl.textContent += (transcriptEl.textContent ? "\\n" : "") + text;
+    }
+  }
+
+  // Downsample Float32 @ input SR to Int16 @ 16kHz
+  function downsampleTo16kHz(float32Array, inSampleRate) {
+    const outSampleRate = 16000;
+    if (inSampleRate === outSampleRate) {
+      const int16 = new Int16Array(float32Array.length);
+      for (let i = 0; i < float32Array.length; i++) {
+        let s = Math.max(-1, Math.min(1, float32Array[i]));
+        int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+      return int16.buffer;
+    }
+
+    const ratio = inSampleRate / outSampleRate;
+    const newLength = Math.round(float32Array.length / ratio);
+    const result = new Int16Array(newLength);
+    let offset = 0;
+    for (let i = 0; i < newLength; i++) {
+      const nextOffset = Math.round((i + 1) * ratio);
+      let sum = 0, count = 0;
+      for (let j = offset; j < nextOffset && j < float32Array.length; j++) {
+        sum += float32Array[j];
+        count++;
+      }
+      const v = count ? (sum / count) : 0;
+      const s = Math.max(-1, Math.min(1, v));
+      result[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      offset = nextOffset;
+    }
+    return result.buffer;
+  }
+
+  async function start() {
+    if (running) return;
+    running = true;
+    transcriptEl.textContent = "";
+    setStatus("Requesting microphone...");
+
+    try {
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        video: false
+      });
+    } catch (err) {
+      console.error(err);
+      setStatus("Microphone permission denied.");
+      running = false;
+      return;
+    }
+
+    audioContext = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
+    const inputSampleRate = audioContext.sampleRate;
+    sourceNode = audioContext.createMediaStreamSource(mediaStream);
+
+    const bufferSize = 4096; // reasonable latency
+    processorNode = audioContext.createScriptProcessor(bufferSize, 1, 1);
+
+    processorNode.onaudioprocess = (event) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const input = event.inputBuffer.getChannelData(0);
+      const pcm16 = downsampleTo16kHz(input, inputSampleRate);
+      try { ws.send(pcm16); } catch (e) { console.error("WS send error:", e); }
+    };
+
+    sourceNode.connect(processorNode);
+    processorNode.connect(audioContext.destination); // needed on some browsers
+
+    ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+    ws.binaryType = "arraybuffer";
+
+    ws.onopen = () => {
+      setStatus("WebSocket connected. Streaming audio…");
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === "transcript") {
+          if (msg.is_final) addFinal(msg.text);
+          else setPartial(msg.text);
+        } else if (msg.type === "info") {
+          setStatus(msg.message);
         }
+      } catch {
+        // non-JSON messages, ignore
+      }
+    };
 
-        // Start WebSocket connection
-        function connectWebSocket() {
-            if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-                console.log("WebSocket already open or connecting.");
-                return;
-            }
-            ws = new WebSocket("ws://localhost:8000/ws");
+    ws.onclose = () => { setStatus("WebSocket closed."); cleanup(); };
+    ws.onerror = (e) => { console.error("WebSocket error:", e); setStatus("WebSocket error."); };
+  }
 
-            ws.onopen = (event) => {
-                console.log("WebSocket connected:", event);
-                updateUI(false); // UI ready to start recording
-                statusDisplay.textContent = "Ready. Click 'Start Listening'.";
-            };
+  function stop() {
+    if (!running) return;
+    running = false;
+    setStatus("Stopping…");
 
-            ws.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                if (data.type === 'transcription') {
-                    transcriptionDisplay.textContent = data.text; // Display the latest transcription
-                } else {
-                    console.log("Received unknown message type:", data);
-                }
-            };
+    try { if (ws && ws.readyState === WebSocket.OPEN) ws.close(); } catch {}
+    cleanup();
+  }
 
-            ws.onclose = (event) => {
-                console.log("WebSocket closed:", event);
-                updateUI(false);
-                statusDisplay.textContent = "WebSocket disconnected. Refresh page to reconnect.";
-            };
+  function cleanup() {
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
 
-            ws.onerror = (error) => {
-                console.error("WebSocket error:", error);
-                updateUI(false);
-                statusDisplay.textContent = "WebSocket error. Check console.";
-            };
-        }
+    if (processorNode) { try { processorNode.disconnect(); } catch {} processorNode.onaudioprocess = null; processorNode = null; }
+    if (sourceNode) { try { sourceNode.disconnect(); } catch {} sourceNode = null; }
+    if (audioContext) { try { audioContext.close(); } catch {} audioContext = null; }
+    if (mediaStream) { for (const track of mediaStream.getTracks()) track.stop(); mediaStream = null; }
+    if (ws) { try { ws.close(); } catch {} ws = null; }
 
-        // Request microphone access and start recording
-        async function startRecording() {
-            try {
-                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                // We will use AudioContext to ensure 16kHz sample rate and LINEAR16 PCM format
-                const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                const source = audioContext.createMediaStreamSource(stream);
-                const processor = audioContext.createScriptProcessor(4096, 1, 1); // Buffer size, input channels, output channels
+    setStatus("Idle");
+  }
 
-                source.connect(processor);
-                processor.connect(audioContext.destination);
-
-                // This function will be called repeatedly with audio data
-                processor.onaudioprocess = (event) => {
-                    if (ws.readyState === WebSocket.OPEN) {
-                        // Get 16-bit PCM data
-                        const inputBuffer = event.inputBuffer.getChannelData(0);
-                        const pcm16 = new Int16Array(inputBuffer.length);
-                        for (let i = 0; i < inputBuffer.length; i++) {
-                            pcm16[i] = Math.max(-1, Math.min(1, inputBuffer[i])) * 0x7FFF; // Convert float to 16-bit int
-                        }
-                        ws.send(pcm16.buffer); // Send as binary data
-                    }
-                };
-
-                // Store MediaRecorder and stream to stop them later
-                mediaRecorder = { stream, processor, source, audioContext }; // Store references to stop
-                updateUI(true);
-                statusDisplay.textContent = "Listening...";
-                transcriptionDisplay.textContent = ''; // Clear previous transcription
-
-            } catch (error) {
-                console.error("Error accessing microphone:", error);
-                statusDisplay.textContent = "Error: Microphone access denied or not available.";
-                updateUI(false);
-            }
-        }
-
-        // Stop recording and close microphone stream
-        function stopRecording() {
-            if (mediaRecorder) {
-                mediaRecorder.processor.disconnect();
-                mediaRecorder.source.disconnect();
-                mediaRecorder.audioContext.close();
-                mediaRecorder.stream.getTracks().forEach(track => track.stop());
-                mediaRecorder = null;
-            }
-            // Send a signal to the server that recording has stopped (optional, but good for state management)
-            if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'stop_recording' }));
-            }
-            updateUI(false);
-            statusDisplay.textContent = "Recording stopped. Processing transcription...";
-        }
-
-        // Event Listeners
-        startButton.addEventListener('click', startRecording);
-        stopButton.addEventListener('click', stopRecording);
-
-        // Initial WebSocket connection attempt
-        connectWebSocket();
-    </script>
+  document.getElementById('startBtn').addEventListener('click', start);
+  document.getElementById('stopBtn').addEventListener('click', stop);
+})();
+</script>
 </body>
 </html>
 """
 
-@app.get("/")
-async def get():
-    # MODIFIED: Changed print to logging.info
-    logging.info("Root route accessed!") 
-    return HTMLResponse(html)
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return HTML_CLIENT
 
-# Google Cloud Speech-to-Text client
-# Kept outside the endpoint for now, as it was in your connecting version
-client = speech.SpeechClient()
+# ------------------------------------------------------------------------------
+# Google STT config builders
+# ------------------------------------------------------------------------------
+def build_streaming_config() -> speech.StreamingRecognitionConfig:
+    """Builds a StreamingRecognitionConfig (with nested RecognitionConfig)."""
+    rec_config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=16000,
+        language_code="en-US",
+        enable_automatic_punctuation=True,
+    )
+    streaming_config = speech.StreamingRecognitionConfig(
+        config=rec_config,
+        interim_results=True,
+        single_utterance=False,
+    )
+    return streaming_config
 
-# Configuration for the streaming recognition request
-config = speech.RecognitionConfig(
-    encoding=ENCODING,
-    sample_rate_hertz=RATE,
-    language_code="en-US",
-)
-streaming_config = speech.StreamingRecognitionConfig(
-    config=config,
-    interim_results=True, # Set to True to get real-time partial results
-    single_utterance=False, # Set to True if you want to stop after one detected utterance
-)
-
-# WebSocket endpoint for real-time audio transcription
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    # MODIFIED: Changed print to logging.info
-    logging.info("WebSocket connection accepted.")
-
-    # Create a queue to hold incoming audio chunks
-    audio_queue: asyncio.Queue = asyncio.Queue()
-    # Flag to signal when to stop processing audio (e.g., client disconnected)
-    stop_audio_processing = asyncio.Event()
-
-    async def consume_websocket_audio():
-        """Consumes audio data from the WebSocket and puts it into the queue."""
+# ------------------------------------------------------------------------------
+# Request generators for both API styles
+# ------------------------------------------------------------------------------
+def audio_requests_only_generator(q: Queue):
+    """Yields only audio_content requests (for old API that takes config as separate arg)."""
+    while True:
         try:
-            while True:
-                # Receive bytes (audio data) or text (control messages)
-                message = await websocket.receive()
-                if "bytes" in message:
-                    audio_chunk = message["bytes"]
-                    # MODIFIED: Changed print to logging.info
-                    logging.info(f"Received audio chunk of size: {len(audio_chunk)} bytes")
-                    await audio_queue.put(audio_chunk)
-                elif "text" in message:
-                    control_message = json.loads(message["text"])
-                    if control_message.get("type") == "stop_recording":
-                        # MODIFIED: Changed print to logging.info
-                        logging.info("Client sent stop_recording signal.")
-                        stop_audio_processing.set() # Signal to stop the audio processing
-                        await audio_queue.put(None) # Put a sentinel value to unblock the generator
-                        break
-        except WebSocketDisconnect:
-            # MODIFIED: Changed print to logging.info
-            logging.info("WebSocket disconnected by client.")
-        except Exception as e:
-            # MODIFIED: Changed print to logging.error
-            logging.error(f"Error consuming websocket audio: {e}")
+            chunk = q.get(timeout=0.1)
+        except Empty:
+            continue
+        if chunk is None:
+            break
+        yield speech.StreamingRecognizeRequest(audio_content=chunk)
+
+def full_requests_generator(q: Queue, streaming_config: speech.StreamingRecognitionConfig):
+    """Yields first a config request, then audio_content (for newer API style)."""
+    # First config request
+    yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
+    # Then audio
+    for req in audio_requests_only_generator(q):
+        yield req
+
+# ------------------------------------------------------------------------------
+# Worker thread: run Google STT streaming and post results back via an asyncio queue
+# ------------------------------------------------------------------------------
+def stt_worker(
+    audio_q: Queue,
+    resp_async_q: asyncio.Queue,
+    stop_event: threading.Event,
+    credentials_ok: bool,
+    loop: asyncio.AbstractEventLoop,
+):
+    thread_logger = logging.getLogger("stt-worker")
+    try:
+        if not credentials_ok:
+            raise RuntimeError(
+                "GOOGLE_APPLICATION_CREDENTIALS not set; cannot initialize SpeechClient."
+            )
+
+        client = speech.SpeechClient()
+        streaming_config = build_streaming_config()
+
+        # Detect which signature is available
+        sig = inspect.signature(client.streaming_recognize)
+        has_config_param = "config" in sig.parameters
+        if has_config_param:
+            thread_logger.info("Using OLD streaming_recognize signature: streaming_recognize(config=..., requests=...)")
+            requests_iter = audio_requests_only_generator(audio_q)
+        else:
+            thread_logger.info("Using NEW streaming_recognize signature: streaming_recognize(requests=...) with initial config request")
+            requests_iter = full_requests_generator(audio_q, streaming_config)
+
+        thread_logger.info("Starting Google streaming_recognize...")
+        # Invoke the API according to detected signature
+        if has_config_param:
+            responses = client.streaming_recognize(config=streaming_config, requests=requests_iter)
+        else:
+            responses = client.streaming_recognize(requests=requests_iter)
+
+        # Iterate over responses (each response may contain multiple results)
+        for response in responses:
+            thread_logger.debug("Raw response: %s", response)
+
+            if not response.results:
+                loop.call_soon_threadsafe(
+                    resp_async_q.put_nowait, {"type": "info", "message": "No results in current response."}
+                )
+                continue
+
+            for result in response.results:
+                if not result.alternatives:
+                    continue
+                transcript = result.alternatives[0].transcript
+                is_final = bool(result.is_final)
+
+                thread_logger.info("Transcript (%s): %s", "final" if is_final else "partial", transcript)
+
+                loop.call_soon_threadsafe(
+                    resp_async_q.put_nowait,
+                    {"type": "transcript", "text": transcript, "is_final": is_final},
+                )
+
+        thread_logger.info("Google streaming_recognize iterator ended.")
+    except Exception as e:
+        thread_logger.exception("STT worker error: %s", e)
+        with contextlib.suppress(Exception):
+            loop.call_soon_threadsafe(
+                resp_async_q.put_nowait, {"type": "info", "message": f"STT error: {e}"}
+            )
+    finally:
+        stop_event.set()
+        thread_logger.info("STT worker exiting.")
+
+# ------------------------------------------------------------------------------
+# WebSocket endpoint
+# ------------------------------------------------------------------------------
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await ws.accept()
+    logger.info("WebSocket client connected: %s", ws.client)
+
+    # Check credentials early for clear errors
+    credentials_ok = bool(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"))
+    if not credentials_ok:
+        msg = "Server missing GOOGLE_APPLICATION_CREDENTIALS; transcription will not work."
+        logger.error(msg)
+        await ws.send_text(json.dumps({"type": "info", "message": msg}))
+
+    audio_q: Queue = Queue(maxsize=100)          # audio chunks for STT worker
+    responses_q: asyncio.Queue = asyncio.Queue() # messages back to browser
+    stop_event = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    # Launch STT worker in a dedicated thread
+    stt_thread = threading.Thread(
+        target=stt_worker,
+        name="STT-Thread",
+        args=(audio_q, responses_q, stop_event, credentials_ok, loop),
+        daemon=True,
+    )
+    stt_thread.start()
+    logger.info("STT worker thread started.")
+
+    # Task to forward STT responses back to the client
+    async def sender_task():
+        try:
+            while not stop_event.is_set():
+                try:
+                    msg = await asyncio.wait_for(responses_q.get(), timeout=0.2)
+                except asyncio.TimeoutError:
+                    continue
+                try:
+                    await ws.send_text(json.dumps(msg))
+                except Exception as e:
+                    logger.exception("Error sending WS message: %s", e)
+                    break
         finally:
-            stop_audio_processing.set() # Ensure processing stops on any error/disconnect
-            if audio_queue.empty(): # Only put None if not already processing
-                await audio_queue.put(None) # Ensure the generator is unblocked
+            logger.info("Sender task terminated.")
 
-    async def generate_audio_requests():
-        """Generates StreamingRecognizeRequest objects from audio chunks."""
-        while not stop_audio_processing.is_set():
-            chunk = await audio_queue.get()
-            if chunk is None: # Sentinel value to stop generator
-                break
-            yield speech.StreamingRecognizeRequest(audio_content=chunk)
-        # MODIFIED: Changed print to logging.info
-        logging.info("Audio request generator stopped.")
-
-
-    # Start consuming audio from the WebSocket in a background task
-    consumer_task = asyncio.create_task(consume_websocket_audio())
+    sender = asyncio.create_task(sender_task())
 
     try:
-        # Start the Google Speech-to-Text streaming recognition
-        # The first request in the stream must contain the streaming_config
-        requests = [speech.StreamingRecognizeRequest(streaming_config=streaming_config)]
+        await ws.send_text(json.dumps({"type": "info", "message": "Ready to receive audio (16kHz LINEAR16)."}))
 
-        # Add the audio content to the requests stream from our generator
-        audio_requests_generator = generate_audio_requests()
-        async for request in audio_requests_generator:
-            requests.append(request)
+        # Receive loop: accept both bytes and text (for control)
+        while True:
+            try:
+                data = await ws.receive()
+            except WebSocketDisconnect:
+                logger.info("WebSocket disconnected by client.")
+                break
 
-        # This call sends the requests and receives responses in real-time
-        # MODIFIED: Changed print to logging.info for transcription
-        responses = client.streaming_recognize(iter(requests)) # Use iter() to make it an async iterable
+            msg_type = data.get("type")
+            if msg_type == "websocket.disconnect":
+                logger.info("WebSocket disconnect event.")
+                break
 
-        async for response in responses:
-            if not response.results:
-                continue
+            if msg_type == "websocket.receive":
+                if "bytes" in data and data["bytes"] is not None:
+                    chunk: bytes = data["bytes"]
+                    logger.info("Received audio chunk: %d bytes", len(chunk))
+                    try:
+                        audio_q.put_nowait(chunk)
+                    except Exception:
+                        logger.warning("Audio queue full; dropping a chunk of %d bytes", len(chunk))
+                elif "text" in data and data["text"] is not None:
+                    text = data["text"]
+                    logger.info("Received WS text message: %s", text)
+                    if text.strip().lower() in {"stop", "close", "eos"}:
+                        break
+                    await ws.send_text(json.dumps({"type": "info", "message": f"Server received text: {text}"}))
+            else:
+                logger.debug("Unhandled WS event: %s", msg_type)
 
-            # The first result in the list is the most relevant
-            result = response.results[0]
-            if not result.alternatives:
-                continue
-
-            # The first alternative is the most likely transcription
-            transcript = result.alternatives[0].transcript
-
-            # Only send back final results for now, or interim results if enabled
-            if result.is_final or streaming_config.interim_results:
-                # MODIFIED: Changed print to logging.info
-                logging.info(f"Transcription: {transcript}")
-                # Send the transcription back to the client
-                await websocket.send_json({"type": "transcription", "text": transcript})
-
-    except asyncio.CancelledError:
-        # MODIFIED: Changed print to logging.info
-        logging.info("Streaming recognition cancelled.")
     except Exception as e:
-        # MODIFIED: Changed print to logging.error
-        logging.error(f"Error during streaming recognition: {e}")
+        logger.exception("WebSocket handler error: %s", e)
     finally:
-        # Clean up: cancel the consumer task and close the WebSocket
-        consumer_task.cancel()
-        await websocket.close()
-        # MODIFIED: Changed print to logging.info
-        logging.info("WebSocket connection closed.")
+        # Signal worker to stop by sending sentinel None
+        with contextlib.suppress(Exception):
+            audio_q.put_nowait(None)
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        stop_event.set()
+
+        # Wait briefly for worker to exit
+        with contextlib.suppress(Exception):
+            stt_thread.join(timeout=2.0)
+
+        # Close sender task
+        with contextlib.suppress(Exception):
+            sender.cancel()
+            await sender
+
+        # Close the socket
+        with contextlib.suppress(Exception):
+            await ws.close()
+
+        logger.info("WebSocket connection closed.")
+
+# ------------------------------------------------------------------------------
+# Startup log
+# ------------------------------------------------------------------------------
+@app.on_event("startup")
+async def on_startup():
+    cred = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if cred:
+        logger.info("GOOGLE_APPLICATION_CREDENTIALS is set: %s", cred)
+    else:
+        logger.warning("GOOGLE_APPLICATION_CREDENTIALS is not set. STT will fail until configured.")
+    logger.info("App started. Open http://127.0.0.1:8000 in your browser.")
