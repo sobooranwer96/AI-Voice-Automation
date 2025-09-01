@@ -23,511 +23,74 @@
 
 import asyncio
 import contextlib
-import inspect
 import json
 import logging
 import os
 import threading
-from queue import Queue, Empty
+from queue import Queue
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
-# Google Cloud Speech-to-Text
-from google.cloud import speech
-
-# NEW: Import Google Generative AI (Gemini)
+# Import modules from our refactored structure
+from app.api import web_client_routes
+from app.api import websocket_routes
+from app.services import speech_to_text
+from app.services.llm_service import LLMService
 import google.generativeai as genai
 
 # ------------------------------------------------------------------------------
 # Logging setup
 # ------------------------------------------------------------------------------
 logging.basicConfig(
-    level=logging.DEBUG, # Set to DEBUG to see all granular logs
+    level=logging.DEBUG,
     format="%(asctime)s | %(levelname)s | %(threadName)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("voice-assistant")
+logger = logging.getLogger("voice-assistant-main")
 
 # ------------------------------------------------------------------------------
 # FastAPI app
 # ------------------------------------------------------------------------------
 app = FastAPI(title="Real-time Voice Assistant (FastAPI + Google STT + Gemini)")
 
-# ------------------------------------------------------------------------------
-# HTML Client (embedded, self-contained)
-# ------------------------------------------------------------------------------
-HTML_CLIENT = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8"/>
-  <title>Real-time Voice Assistant Demo</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 2rem; }
-    h1 { margin-top: 0; }
-    button { padding: 0.6rem 1rem; margin-right: 0.5rem; border-radius: 8px; border: 1px solid #ccc; background: #f7f7f7; cursor: pointer; }
-    button:disabled { opacity: 0.5; cursor: not-allowed; }
-    #status { margin-top: 0.75rem; font-size: 0.95rem; color: #555; }
-    #transcript { margin-top: 1rem; padding: 1rem; min-height: 120px; border: 1px solid #ddd; border-radius: 8px; background: #fafafa; white-space: pre-wrap; }
-    .small { font-size: 0.85rem; color: #666; }
-    .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
-    code { background: #f0f0f0; padding: 0 0.25rem; border-radius: 4px; }
-  </style>
-</head>
-<body>
-  <h1>🎙️ Real-time Transcription</h1>
-  <div class="row">
-    <button id="startBtn">Start Listening</button>
-    <button id="stopBtn" disabled>Stop Listening</button>
-    <span id="status">Idle</span>
-  </div>
-  <div id="transcript" aria-live="polite"></div>
-  <p class="small">
-    This demo captures microphone audio, downsamples to <code>16 kHz</code>, encodes as
-    <code>LINEAR16</code> (16-bit PCM), and streams it over a WebSocket to the server.
-    Live transcriptions appear above (partial and final).
-  </p>
-
-<script>
-(() => {
-  let ws = null;
-  let audioContext = null;
-  let mediaStream = null;
-  let sourceNode = null;
-  let processorNode = null;
-  let running = false;
-
-  const startBtn = document.getElementById('startBtn');
-  const stopBtn  = document.getElementById('stopBtn');
-  const statusEl = document.getElementById('status');
-  const transcriptEl = document.getElementById('transcript');
-
-  function setStatus(msg) {
-    statusEl.textContent = msg;
-  }
-
-  function setPartial(text) {
-    // Show/replace a single partial line at the end
-    const lines = transcriptEl.textContent.split("\\n");
-    if (lines.length && lines[lines.length - 1].startsWith("[partial] ")) {
-      lines[lines.length - 1] = "[partial] " + text;
-      transcriptEl.textContent = lines.join("\\n");
-    } else {
-      transcriptEl.textContent += (transcriptEl.textContent ? "\\n" : "") + "[partial] " + text;
-    }
-  }
-
-  function addFinal(text) {
-    // Replace any trailing partial with final; else just append
-    const lines = transcriptEl.textContent.split("\\n");
-    if (lines.length && lines[lines.length - 1].startsWith("[partial] ")) {
-      lines[lines.length - 1] = text;
-      transcriptEl.textContent = lines.join("\\n");
-    } else {
-      transcriptEl.textContent += (transcriptEl.textContent ? "\\n" : "") + text;
-    }
-  }
-
-  // Downsample Float32 @ input SR to Int16 @ 16kHz
-  function downsampleTo16kHz(float32Array, inSampleRate) {
-    const outSampleRate = 16000;
-    if (inSampleRate === outSampleRate) {
-      const int16 = new Int16Array(float32Array.length);
-      for (let i = 0; i < float32Array.length; i++) {
-        let s = Math.max(-1, Math.min(1, float32Array[i]));
-        int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-      }
-      return int16.buffer;
-    }
-
-    const ratio = inSampleRate / outSampleRate;
-    const newLength = Math.round(float32Array.length / ratio);
-    const result = new Int16Array(newLength);
-    let offset = 0;
-    for (let i = 0; i < newLength; i++) {
-      const nextOffset = Math.round((i + 1) * ratio);
-      let sum = 0, count = 0;
-      for (let j = offset; j < nextOffset && j < float32Array.length; j++) {
-        sum += float32Array[j];
-        count++;
-      }
-      const v = count ? (sum / count) : 0;
-      const s = Math.max(-1, Math.min(1, v));
-      result[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-      offset = nextOffset;
-    }
-    return result.buffer;
-  }
-
-  async function start() {
-    if (running) return;
-    running = true;
-    transcriptEl.textContent = "";
-    setStatus("Requesting microphone...");
-
-    try {
-      mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-        video: false
-      });
-    } catch (err) {
-      console.error(err);
-      setStatus("Microphone permission denied.");
-      running = false;
-      return;
-    }
-
-    audioContext = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
-    const inputSampleRate = audioContext.sampleRate;
-    sourceNode = audioContext.createMediaStreamSource(mediaStream);
-
-    const bufferSize = 4096; // reasonable latency
-    processorNode = audioContext.createScriptProcessor(bufferSize, 1, 1);
-
-    processorNode.onaudioprocess = (event) => {
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      const input = event.inputBuffer.getChannelData(0);
-      const pcm16 = downsampleTo16kHz(input, inputSampleRate);
-      try { ws.send(pcm16); } catch (e) { console.error("WS send error:", e); }
-    };
-
-    sourceNode.connect(processorNode);
-    processorNode.connect(audioContext.destination); // needed on some browsers
-
-    ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
-    ws.binaryType = "arraybuffer";
-
-    ws.onopen = () => {
-      setStatus("WebSocket connected. Streaming audio…");
-      startBtn.disabled = true;
-      stopBtn.disabled = false;
-    };
-
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        if (msg.type === "transcript") {
-          if (msg.is_final) addFinal(msg.text);
-          else setPartial(msg.text);
-        } else if (msg.type === "info") {
-          setStatus(msg.message);
-        } else if (msg.type === "gemini_response") {
-          addFinal("AI: " + msg.text);
-          setStatus("AI responded.");
-        }
-      } catch {
-        // non-JSON messages, ignore
-      }
-    };
-
-    ws.onclose = () => { setStatus("WebSocket closed."); cleanup(); };
-    ws.onerror = (e) => { console.error("WebSocket error:", e); setStatus("WebSocket error."); };
-  }
-
-  function stop() {
-    if (!running) return;
-    running = false;
-    setStatus("Stopping…");
-
-    try { if (ws && ws.readyState === WebSocket.OPEN) ws.close(); } catch {}
-    cleanup();
-  }
-
-  function cleanup() {
-    startBtn.disabled = false;
-    stopBtn.disabled = true;
-
-    if (processorNode) { try { processorNode.disconnect(); } catch {} processorNode.onaudioprocess = null; processorNode = null; }
-    if (sourceNode) { try { sourceNode.disconnect(); } catch {} sourceNode = null; }
-    if (audioContext) { try { audioContext.close(); } catch {} audioContext = null; }
-    if (mediaStream) { for (const track of mediaStream.getTracks()) track.stop(); mediaStream = null; }
-    if (ws) { try { ws.close(); } catch {} ws = null; }
-
-    setStatus("Idle");
-  }
-
-  document.getElementById('startBtn').addEventListener('click', start);
-  document.getElementById('stopBtn').addEventListener('click', stop);
-})();
-</script>
-</body>
-</html>
-"""
-
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return HTML_CLIENT
+app.include_router(web_client_routes.router)
+app.include_router(websocket_routes.router)
 
 # ------------------------------------------------------------------------------
-# Google STT config builders
+# Global LLM Service Instance (initialized on startup)
 # ------------------------------------------------------------------------------
-def build_streaming_config() -> speech.StreamingRecognitionConfig:
-    """Builds a StreamingRecognitionConfig (with nested RecognitionConfig)."""
-    rec_config = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-        sample_rate_hertz=16000,
-        language_code="en-US",
-        enable_automatic_punctuation=True,
-    )
-    streaming_config = speech.StreamingRecognitionConfig(
-        config=rec_config,
-        interim_results=True,
-        single_utterance=False,
-    )
-    return streaming_config
+llm_service_instance: Optional[LLMService] = None
 
 # ------------------------------------------------------------------------------
-# Request generators for both API styles
-# ------------------------------------------------------------------------------
-def audio_requests_only_generator(q: Queue):
-    """Yields only audio_content requests (for old API that takes config as separate arg)."""
-    while True:
-        try:
-            chunk = q.get(timeout=0.1)
-        except Empty:
-            continue
-        if chunk is None:
-            break
-        yield speech.StreamingRecognizeRequest(audio_content=chunk)
-
-def full_requests_generator(q: Queue, streaming_config: speech.StreamingRecognitionConfig):
-    """Yields first a config request, then audio_content (for newer API style)."""
-    # First config request
-    yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
-    # Then audio
-    for req in audio_requests_only_generator(q):
-        yield req
-
-# ------------------------------------------------------------------------------
-# Worker thread: run Google STT streaming and post results back via an asyncio queue
-# ------------------------------------------------------------------------------
-def stt_worker(
-    audio_q: Queue,
-    resp_async_q: asyncio.Queue,
-    stop_event: threading.Event,
-    credentials_ok: bool,
-    loop: asyncio.AbstractEventLoop,
-):
-    thread_logger = logging.getLogger("stt-worker")
-    
-    # NEW: Initialize Gemini model
-    gemini_api_key = os.environ.get("VOICE_ASSISTANT_GEMINI_API_KEY")
-    if not gemini_api_key:
-        thread_logger.error("VOICE_ASSISTANT_GEMINI_API_KEY not set. Gemini calls will fail.")
-        gemini_model = None # Set to None if API key is missing
-    else:
-        genai.configure(api_key=gemini_api_key)
-        gemini_model = genai.GenerativeModel('gemini-2.5-flash')
-        thread_logger.info("Gemini model initialized.")
-
-    try:
-        if not credentials_ok:
-            raise RuntimeError(
-                "GOOGLE_APPLICATION_CREDENTIALS not set; cannot initialize SpeechClient."
-            )
-
-        client = speech.SpeechClient()
-        streaming_config = build_streaming_config()
-
-        # Detect which signature is available
-        sig = inspect.signature(client.streaming_recognize)
-        has_config_param = "config" in sig.parameters
-        if has_config_param:
-            thread_logger.info("Using OLD streaming_recognize signature: streaming_recognize(config=..., requests=...)")
-            requests_iter = audio_requests_only_generator(audio_q)
-        else:
-            thread_logger.info("Using NEW streaming_recognize signature: streaming_recognize(requests=...) with initial config request")
-            requests_iter = full_requests_generator(audio_q, streaming_config)
-
-        thread_logger.info("Starting Google streaming_recognize...")
-        # Invoke the API according to detected signature
-        if has_config_param:
-            responses = client.streaming_recognize(config=streaming_config, requests=requests_iter)
-        else:
-            responses = client.streaming_recognize(requests=requests_iter)
-
-        # Iterate over responses (each response may contain multiple results)
-        for response in responses:
-            thread_logger.debug("Raw STT response: %s", response) # Renamed log for clarity
-
-            if not response.results:
-                loop.call_soon_threadsafe(
-                    resp_async_q.put_nowait, {"type": "info", "message": "No STT results in current response."}
-                )
-                continue
-
-            for result in response.results:
-                if not result.alternatives:
-                    continue
-                transcript = result.alternatives[0].transcript
-                is_final = bool(result.is_final)
-
-                thread_logger.info("STT Transcript (%s): %s", "final" if is_final else "partial", transcript) # Renamed log for clarity
-
-                loop.call_soon_threadsafe(
-                    resp_async_q.put_nowait,
-                    {"type": "transcript", "text": transcript, "is_final": is_final},
-                )
-
-                # NEW: Call Gemini with final transcript
-                if is_final and gemini_model:
-                    thread_logger.info("Calling Gemini with final transcript: '%s'", transcript)
-                    try:
-                        gemini_response = gemini_model.generate_content(transcript)
-                        gemini_text = gemini_response.text
-                        thread_logger.info("Gemini Response: %s", gemini_text)
-                        loop.call_soon_threadsafe(
-                            resp_async_q.put_nowait,
-                            {"type": "gemini_response", "text": gemini_text},
-                        )
-                    except Exception as gemini_e:
-                        thread_logger.exception("Error calling Gemini API: %s", gemini_e)
-                        loop.call_soon_threadsafe(
-                            resp_async_q.put_nowait, {"type": "info", "message": f"Gemini error: {gemini_e}"}
-                        )
-
-
-        thread_logger.info("Google streaming_recognize iterator ended.")
-    except Exception as e:
-        thread_logger.exception("STT worker error: %s", e)
-        with contextlib.suppress(Exception):
-            loop.call_soon_threadsafe(
-                resp_async_q.put_nowait, {"type": "info", "message": f"STT worker critical error: {e}"}
-            )
-    finally:
-        stop_event.set()
-        thread_logger.info("STT worker exiting.")
-
-# ------------------------------------------------------------------------------
-# WebSocket endpoint
-# ------------------------------------------------------------------------------
-@app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
-    await ws.accept()
-    logger.info("WebSocket client connected: %s", ws.client)
-
-    # Check credentials early for clear errors
-    credentials_ok = bool(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"))
-    if not credentials_ok:
-        msg = "Server missing GOOGLE_APPLICATION_CREDENTIALS; transcription will not work."
-        logger.error(msg)
-        await ws.send_text(json.dumps({"type": "info", "message": msg}))
-    
-    # NEW: Check Gemini API key
-    gemini_key_ok = bool(os.environ.get("VOICE_ASSISTANT_GEMINI_API_KEY"))
-    if not gemini_key_ok:
-        msg = "Server missing VOICE_ASSISTANT_GEMINI_API_KEY; Gemini LLM will not work."
-        logger.error(msg)
-        await ws.send_text(json.dumps({"type": "info", "message": msg}))
-
-
-    audio_q: Queue = Queue(maxsize=100)          # audio chunks for STT worker
-    responses_q: asyncio.Queue = asyncio.Queue() # messages back to browser
-    stop_event = threading.Event()
-    loop = asyncio.get_running_loop()
-
-    # Launch STT worker in a dedicated thread
-    stt_thread = threading.Thread(
-        target=stt_worker,
-        name="STT-Thread",
-        args=(audio_q, responses_q, stop_event, credentials_ok, loop),
-        daemon=True,
-    )
-    stt_thread.start()
-    logger.info("STT worker thread started.")
-
-    # Task to forward STT responses and Gemini responses back to the client
-    async def sender_task():
-        try:
-            while not stop_event.is_set():
-                try:
-                    msg = await asyncio.wait_for(responses_q.get(), timeout=0.2)
-                except asyncio.TimeoutError:
-                    continue
-                try:
-                    await ws.send_text(json.dumps(msg))
-                except Exception as e:
-                    logger.exception("Error sending WS message: %s", e)
-                    break
-        finally:
-            logger.info("Sender task terminated.")
-
-    sender = asyncio.create_task(sender_task())
-
-    try:
-        await ws.send_text(json.dumps({"type": "info", "message": "Ready to receive audio (16kHz LINEAR16)."}))
-
-        # Receive loop: accept both bytes and text (for control)
-        while True:
-            try:
-                data = await ws.receive()
-            except WebSocketDisconnect:
-                logger.info("WebSocket disconnected by client.")
-                break
-
-            msg_type = data.get("type")
-            if msg_type == "websocket.disconnect":
-                logger.info("WebSocket disconnect event.")
-                break
-
-            if msg_type == "websocket.receive":
-                if "bytes" in data and data["bytes"] is not None:
-                    chunk: bytes = data["bytes"]
-                    logger.debug("Received audio chunk: %d bytes", len(chunk))
-                    try:
-                        audio_q.put_nowait(chunk)
-                    except Exception:
-                        logger.warning("Audio queue full; dropping a chunk of %d bytes", len(chunk))
-                elif "text" in data and data["text"] is not None:
-                    text = data["text"]
-                    logger.info("Received WS text message: %s", text)
-                    if text.strip().lower() in {"stop", "close", "eos"}:
-                        break
-                    await ws.send_text(json.dumps({"type": "info", "message": f"Server received text: {text}"}))
-            else:
-                logger.debug("Unhandled WS event: %s", msg_type)
-
-    except Exception as e:
-        logger.exception("WebSocket handler error: %s", e)
-    finally:
-        # Signal worker to stop by sending sentinel None
-        with contextlib.suppress(Exception):
-            audio_q.put_nowait(None)
-
-        stop_event.set()
-
-        # Wait briefly for worker to exit
-        with contextlib.suppress(Exception):
-            stt_thread.join(timeout=2.0)
-
-        # Close sender task
-        with contextlib.suppress(Exception):
-            sender.cancel()
-            await sender
-
-        # Close the socket
-        with contextlib.suppress(Exception):
-            await ws.close()
-
-        logger.info("WebSocket connection closed.")
-
-# ------------------------------------------------------------------------------
-# Startup log
+# Startup log and LLM Service Initialization
 # ------------------------------------------------------------------------------
 @app.on_event("startup")
 async def on_startup():
+    global llm_service_instance
+
     cred = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if cred:
         logger.info("GOOGLE_APPLICATION_CREDENTIALS is set: %s", cred)
     else:
         logger.warning("GOOGLE_APPLICATION_CREDENTIALS is not set. STT will fail until configured.")
     
-    gemini_key = os.environ.get("VOICE_ASSISTANT_GEMINI_API_KEY")
-    if gemini_key:
-        logger.info("VOICE_ASSISTANT_GEMINI_API_KEY is set.")
+    gemini_api_key = os.environ.get("VOICE_ASSISTANT_GEMINI_API_KEY")
+    if gemini_api_key:
+        logger.info("VOICE_ASSISTANT_GEMINI_API_KEY is set. Attempting to initialize LLMService.")
+        try:
+            llm_service_instance = LLMService(api_key=gemini_api_key, model_name='gemini-2.5-flash')
+            websocket_routes.llm_service_instance = llm_service_instance
+            logger.info("LLMService initialized successfully.")
+        except Exception as e:
+            logger.error(f"Failed to initialize LLMService: {e}", exc_info=True)
+            llm_service_instance = None
     else:
-        logger.warning("VOICE_ASSISTANT_GEMINI_API_KEY is not set. Gemini LLM will not work.")
+        logger.warning("VOICE_ASSISTANT_GEMINI_API_KEY is not set. LLMService will not be initialized.")
+        llm_service_instance = None
 
     logger.info("App started. Open http://127.0.0.1:8000 in your browser.")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
