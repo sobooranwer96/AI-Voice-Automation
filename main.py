@@ -4,10 +4,11 @@
 #   python -m uvicorn main:app --reload
 #
 # Requires:
-#   pip install fastapi uvicorn google-cloud-speech google-generativeai
-# And set Google credentials:
+#   pip install fastapi uvicorn google-cloud-speech google-generativeai elevenlabs
+# And set credentials:
 #   export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service_account.json
 #   export VOICE_ASSISTANT_GEMINI_API_KEY=YOUR_GEMINI_API_KEY
+#   export VOICE_ASSISTANT_ELEVENLABS_API_KEY=YOUR_ELEVENLABS_API_KEY
 #
 # This app exposes:
 #   - GET  /    -> minimal HTML/JS client to stream mic audio over WebSocket and show live transcripts
@@ -37,7 +38,8 @@ from fastapi.responses import HTMLResponse
 from app.api import web_client_routes
 from app.api import websocket_routes
 from app.services import speech_to_text
-from app.services.llm_service import LLMService
+from app.services.llm_service import LLMService # Import LLMService
+from app.services.text_to_speech import TTSService # NEW: Import TTSService
 import google.generativeai as genai
 
 # ------------------------------------------------------------------------------
@@ -52,22 +54,24 @@ logger = logging.getLogger("voice-assistant-main")
 # ------------------------------------------------------------------------------
 # FastAPI app
 # ------------------------------------------------------------------------------
-app = FastAPI(title="Real-time Voice Assistant (FastAPI + Google STT + Gemini)")
+app = FastAPI(title="Real-time Voice Assistant (FastAPI + Google STT + Gemini + ElevenLabs)")
 
 app.include_router(web_client_routes.router)
 app.include_router(websocket_routes.router)
 
 # ------------------------------------------------------------------------------
-# Global LLM Service Instance (initialized on startup)
+# Global Service Instances (initialized on startup)
 # ------------------------------------------------------------------------------
 llm_service_instance: Optional[LLMService] = None
+tts_service_instance: Optional[TTSService] = None # NEW: Global instance for TTS service
 
 # ------------------------------------------------------------------------------
-# Startup log and LLM Service Initialization
+# Startup log and Service Initialization
 # ------------------------------------------------------------------------------
 @app.on_event("startup")
 async def on_startup():
     global llm_service_instance
+    global tts_service_instance # NEW: Declare global for TTS service
 
     cred = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if cred:
@@ -75,11 +79,28 @@ async def on_startup():
     else:
         logger.warning("GOOGLE_APPLICATION_CREDENTIALS is not set. STT will fail until configured.")
     
+    # Initialize TTSService first, as LLMService needs it
+    elevenlabs_key = os.environ.get("VOICE_ASSISTANT_ELEVENLABS_API_KEY")
+    if elevenlabs_key:
+        logger.info("VOICE_ASSISTANT_ELEVENLABS_API_KEY is set. Attempting to initialize TTSService.")
+        try:
+            tts_service_instance = TTSService(api_key=elevenlabs_key)
+            websocket_routes.tts_service_instance = tts_service_instance # Set in router
+            logger.info("TTSService initialized successfully.")
+        except Exception as e:
+            logger.error(f"Failed to initialize TTSService: {e}", exc_info=True)
+            tts_service_instance = None
+    else:
+        logger.warning("VOICE_ASSISTANT_ELEVENLABS_API_KEY is not set. TTSService will not be initialized.")
+        tts_service_instance = None
+
+    # Now, initialize LLMService and pass the TTS service to it
     gemini_api_key = os.environ.get("VOICE_ASSISTANT_GEMINI_API_KEY")
     if gemini_api_key:
         logger.info("VOICE_ASSISTANT_GEMINI_API_KEY is set. Attempting to initialize LLMService.")
         try:
-            llm_service_instance = LLMService(api_key=gemini_api_key, model_name='gemini-2.5-flash')
+            # Pass the tts_service_instance to the LLMService
+            llm_service_instance = LLMService(api_key=gemini_api_key, model_name='gemini-2.5-flash', tts_service=tts_service_instance)
             websocket_routes.llm_service_instance = llm_service_instance
             logger.info("LLMService initialized successfully.")
         except Exception as e:

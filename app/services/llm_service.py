@@ -1,7 +1,8 @@
+import asyncio
 import os
 import logging
 import google.generativeai as genai
-from typing import Optional
+from typing import Optional, AsyncGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -10,14 +11,15 @@ class LLMService:
     A service class to encapsulate interactions with the Gemini Large Language Model.
     Initializes the Gemini API and provides methods for generating content.
     """
-    def __init__(self, api_key: Optional[str] = None, model_name: str = 'gemini-2.5-flash'):
+    def __init__(self, api_key: Optional[str] = None, model_name: str = 'gemini-2.5-flash', tts_service=None):
         """
         Initializes the LLMService.
 
         Args:
             api_key (Optional[str]): The Gemini API key. If None, it attempts to read
                                       from VOICE_ASSISTANT_GEMINI_API_KEY environment variable.
-            model_name (str): The name of the Gemini model to use (e.g., 'gemini-pro', 'gemini-2.5-flash').
+            model_name (str): The name of the Gemini model to use.
+            tts_service: The Text-to-Speech service instance.
         """
         if api_key is None:
             api_key = os.environ.get("VOICE_ASSISTANT_GEMINI_API_KEY")
@@ -30,6 +32,7 @@ class LLMService:
         try:
             genai.configure(api_key=api_key)
             self.model = genai.GenerativeModel(model_name)
+            self.tts_service = tts_service # Store the TTS service instance
             logger.info(f"LLMService initialized with model: {model_name}")
         except Exception as e:
             logger.error(f"Failed to initialize Gemini model '{model_name}': {e}", exc_info=True)
@@ -51,7 +54,6 @@ class LLMService:
             return None
         
         try:
-            # FIX: Removed 'await'. The error confirms that generate_content is synchronous in your setup.
             response = self.model.generate_content(prompt) 
             if hasattr(response, 'text'):
                 logger.debug(f"Gemini raw response: {response}")
@@ -62,3 +64,18 @@ class LLMService:
         except Exception as e:
             logger.error(f"Error generating content from Gemini: {e}", exc_info=True)
             return f"An error occurred while getting AI response: {e}"
+
+    async def stream_tts_response(self, prompt: str) -> AsyncGenerator[bytes, None]:
+        """
+        Generates an LLM response and then streams the audio of that response
+        using the TTS service.
+        """
+        # First, generate the text response from the LLM
+        llm_text = await self.generate_response(prompt)
+        
+        if llm_text:
+            # Then, stream the audio of that text using the TTS service
+            for chunk in self.tts_service.stream_audio(llm_text):
+                yield chunk
+        else:
+            yield b"" # Yield an empty chunk if no LLM response
